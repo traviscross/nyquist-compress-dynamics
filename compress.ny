@@ -1,30 +1,67 @@
 ;nyquist plug-in
 ;version 1
 ;type process
-;name "Compress dynamics..."
+;categories "http://lv2plug.in/ns/lv2core#CompressorPlugin"
+;name "Compress &dynamics 1.2.6..."
 ;action "Compressing..."
-;info "Does dynamic (volume) compression with lookahead.\n'Compress ratio' is how much to louden the soft parts.\nYou can soften the soft parts with values < 0, and invert\nloudness with values > 1 (lower max amp when you do).\n'Attack speed' is how fast the volume drops to anticipate a loud section.\n'Release speed' is how fast it rises after a loud section.\nLower values give slower changes in volume.\nLower 'maximum amplitude' if you experience clipping.\nRaise 'floor' to make quiet parts stay quiet."
-;control compress-ratio "Compress ratio" real "" .75 -1 2
-;control left-falloff-db-s "Attack speed" real "dB/s" 3 .01 20
-;control right-falloff-db-s "Release speed" real "dB/s" 3 .01 20
-;control floor "Floor" real "linear" .02 0.0 1.0
-;control scale-max "Maximum amplitude" real "linear" .95 .0 1.0
+;info "Does dynamic (volume) compression with lookahead.\n'Compress ratio' is how much compression to apply. Raise when soft parts\n  are too soft, and lower to keep some dynamic range. You can soften the\n  soft parts instead of increasing them with values < 0, and invert\n  loudness with values > 1 (lower max amp when you do).\n'Hardness' is how agressively to compress. Raise when parts are still\n  hard to hear (even with a high compress ratio). Lower when the result\n  sounds distorted.\nRaise 'floor' to make quiet parts stay quiet.\nRaise 'noise gate falloff' to make quiet parts (beneath 'floor') disappear.\nLower 'maximum amplitude' if you experience clipping."
+;control compress-ratio "Compress ratio" real "" .5 -.5 1.25
 
-; umm, this isn't ready for prime-time
-; control use-percep "Use perceptual model" int "yes/no" 0 0 1
-(setf use-percep 0)
+;; TO ENABLE ADVANCED SETTINGS: delete one semicolon from the beginning of the next two lines, then add one to following four.
 
-;;Version 1.1
+;;control left-width-s "Release speed" real "~ms" 510 1 5000
+;;control right-width-s "Attack speed" real "~ms" 340 1 5000
+
+;control hardness "Compression hardness" real "" .5 .1 1
+(setf hardness (* (- 1.1 hardness) 3))
+(setf left-width-s (* hardness hardness 510))
+(setf right-width-s (* hardness hardness 340))
+
+;control floor "Floor" real "dB" -32 -96 0
+;control noise-factor "Noise gate falloff" real "factor" 0 -2 10
+;control scale-max "Maximum amplitude" real "linear" .99 .0 1.0
+
+;; TO ENABLE ADVANCED SETTINGS: delete one semicolon from the beginning of the next two lines, then add one to following two.
+
+;;control left-exponent "Release exponent" real "" 2 1 6
+;;control right-exponent "Attack exponent" real "" 4 1 6
+
+(setf left-exponent 2)
+(setf right-exponent 4)
+
+;;Version 1.2.6
 
 ;;Authored by Chris Capel (http://pdf23ds.net)
 ;;All rights reserved
 ;;Permission granted for personal use, without redistribution.
 
-;;this algorithm works by finding all peaks and putting "tops" on them, which are
-;;lines going each direction that have a slope determined by falloffs. These lines
-;;are constructed so that they never cross a sample value. Together, these tops
-;;form an envelope whose inverse can be applied with pwe and mult to bring all the
-;;tops up to .95.
+;;This algorithm works by enveloping the average of an incoming signal (like
+;;all dynamic compressors, really). The envelope is constructed using sections
+;;of paraboloids (explained below). The closest-fitting envelope possible is
+;;found for paraboloids constructed using the parameters, such no two points
+;;have a connecting paraboloid that passes above an intermediate point on the
+;;envelope. The envelope is inverted and multiplied against the source signal
+;;to apply the appropriate gain.
+
+;;The motivation for using paraboloids is that I was unhappy with the results
+;;using lines (used in a previous version of this plugin). It would not
+;;respond quickly enough to very steep changes in the signal without the
+;;compression getting too hard for my taste. The behavior of this compressor
+;;(with the default parameters) is that the envelope will "hover over"/hug the
+;;low points of the input signal, while applying an accelerating amount of
+;;gain (especially on attacks, but also on release) to meet peaks.
+
+;convert to seconds
+(setf right-width-s (/ right-width-s 1000))
+(setf left-width-s (/ left-width-s 1000))
+
+; umm, this isn't ready for prime-time
+; control use-percep "Use perceptual model" int "yes/no" 0 0 1
+(setf use-percep 0)
+
+(setf *window-size* 1500)
+
+(setf *gc-flag* nil)
 
 ;;Compressing based on perceived loudness--perceptual model
 
@@ -77,122 +114,353 @@
 ;;10240 -7
 ;;20480 -20
 
-(defun my-snd-fetch (snds)
-  (if (arrayp snds)
-      (let ((val1 (snd-fetch (aref snds 0)))
-	    (val2 (snd-fetch (aref snds 1))))
-	(when (not (null val1))
-	  (linear-to-db (max (abs val1) (abs val2)))))
-      (let ((val (snd-fetch snds)))
-	(when (not (null val))
-	  (linear-to-db (abs val))))))
+;;
+
+(defun get-percep-adjusted-sound (sound)
+  (let ((bands '((20 -40)
+                 (40 -23)
+                 (80 -10)
+                 (160 -4)
+                 (320 +3)
+                 (640 +2)
+                 (1280 0)
+                 (2560 +4)
+                 (5120 +9)
+                 (10240 -7)
+                 (20480 -20))))
+    (dolist (band bands)
+      (setf sound (eq-band sound (car band) (cadr band) 1)))
+    sound))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Work with sound arrays
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(setf s-length (/ len *window-size*))
+
+(defun my-snd-fetch-array (snds size)
+  (if (<= s-length 0)
+      nil
+      (if (arrayp snds)
+          (let (buffers)
+            (dotimes (x (length snds))
+              (push (snd-fetch-array (aref snds x) size size)
+                    buffers))
+            (setf s-length (- s-length size))
+            (dotimes (i (length (first buffers)))
+              (setf (aref (first buffers) i)
+                    (apply #'max (mapcar (lambda (x)
+                                           (linear-to-db (abs (aref x i))))
+                                         buffers))))
+            (first buffers))
+          (let ((val (snd-fetch-array snds size size)))
+            (setf s-length (- s-length size))
+            (dotimes (i (length val))
+              (setf (aref val i) (linear-to-db (abs (aref val i)))))
+            val))))
 
 (defun my-snd-srate (snds)
   (if (arrayp snds)
       (snd-srate (aref snds 0))
       (snd-srate snds)))
 
-(defun get-my-sound (sound)
-  (snd-avg (if (= use-percep 1) (get-percep-adjusted-sound sound) sound) 2000 1000 op-peak))
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Paraboloid stuff
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(defun get-percep-adjusted-sound (sound)
-  (let ((bands '((20 -40)
-		 (40 -23)
-		 (80 -10)
-		 (160 -4)
-		 (320 +3)
-		 (640 +2)
-		 (1280 0)
-		 (2560 +4)
-		 (5120 +9)
-		 (10240 -7)
-		 (20480 -20))))
-    (dolist (band bands)
-      (setf sound (eq-band sound (car band) (cadr band) 1)))
-    sound))
+;; A paraboloid is an equation of the form
+;; f(x) =
+;; when x < 0: -abs(x^n1)
+;; when x >= 0: x^n2
 
-(setf max-gain (if (= floor 0) 0 (/ 1.0 floor)))
-(defun limit-amp (samp)
-  (if (and (> floor 0) (> samp max-gain))
-      max-gain
-      samp))
+(defun make-curve (max power coeff)
+  "return (x/coeff)^power for x from 0 to n where (x/coeff)^n is around max"
+  (let (ret (len 0))
+    (do* ((x 0 (+ 1 x))
+          (y 0 (expt (/ x coeff) power)))
+         ((> y max))
+      (push y ret)
+      (incf len))
+    ;return the reversed version
+    (list ret len)))
 
-(defun adjust-samp (samp)
-  ;;convert an envelope value into a gain value
-  (expt (limit-amp (/ scale-max (db-to-linear samp))) compress-ratio))
+;; these are initialized later
+(setf left-width nil)
+(setf right-width nil)
 
-(let* ((snds (if (arrayp s)
-		 (let ((v (make-array 2)))
-		   (dotimes (i 2)
-		     (setf (aref v i) (get-my-sound (aref s i))))
-		   v)
-		 (get-my-sound s)))
-       (right-falloff (/ right-falloff-db-s (my-snd-srate snds))) ;;(db/sec)/(sample/sec)->db/sample
-       (left-falloff (/ left-falloff-db-s (my-snd-srate snds)))
-       (tops nil)
-       (pwe-args '(1.0 1.0 1.0)) ;;initialize it with the final time
-       (max-sample nil))
-  (push (list (linear-to-db 0.0) -1) tops) ;; (db index)
-  ;;first find all the tops we need.
-  ;;we pick up a bunch of extra ones going up the left side of waveform hills
-  (do* ((cur-value (my-snd-fetch snds) (my-snd-fetch snds))
-	(i 0 (1+ i))
-	(top (car tops) (car tops)))
-       ((null cur-value) (setf max-sample (float i)))
-    ;;if the sample is above the line of the current top
-    (when (> cur-value
-	     (- (car top) (* right-falloff (- i (cadr top)))))
-      (push (list cur-value i) tops)))
-  ;;remove all the extra tops
-  (do ((cur-tops tops (cdr cur-tops)))
-      ((null cur-tops))
-    (do ((top (car cur-tops))
-	 (prev-top (cadr cur-tops) (cadr cur-tops)))
-	;;exit if the previous top is not contained within the current one
-        ((or (not prev-top)
-	     (let ((prev (car prev-top))
-		   (cur (- (car top) (* left-falloff
-					(- (cadr top) (cadr prev-top))))))
-	       (> prev cur))))
-      ;;otherwise remove it and repeat
-      (setf (cdr cur-tops) (cddr cur-tops))))
-  ;;ok, we have all our tops now.
-  ;;first set the ending scale
-  (push (adjust-samp
-	 (- (car (car tops))
-	    (* right-falloff
-	       (- max-sample (cadr (car tops))))))
-	pwe-args)
-  (push 1.0 pwe-args)
-  ;;now all the in between ones
-  (do* ((cur-tops tops (cdr cur-tops))
-	(right-top (car cur-tops) (car cur-tops))
-	(left-top (cadr cur-tops) (cadr cur-tops)))
-       ((null right-top))
-    ;;we construct pwe-args in reverse, so first value, then time
-    (push (adjust-samp (car right-top))
-	  pwe-args)
-    ;;convert sample number to 0-1 value
-    (push (/ (cadr right-top) max-sample) pwe-args)
-    (if left-top
-      ;;the intersection of two lines (the two tops), given the slope (a) and a point on both lines
-      ;;calculate offset (b)
-      ;;b_1,2 = y - ax
-      ;;x_i = (b_1 - b_2) / (a_2 - a_1)
-      ;;y_i = a_2 x_i + b_2
-      ;;note that right-falloff is the slope for the left top, and vice versa
-      (let* ((b-left (+ (car left-top) (* right-falloff (cadr left-top))))
-	     (b-right (- (car right-top) (* left-falloff (cadr right-top))))
-	     (x_i (/ (- b-left b-right) (+ right-falloff left-falloff)))
-	     (y_i (+ (* left-falloff x_i) b-right)))
-	(push (adjust-samp y_i) pwe-args)
-	(push (/ x_i max-sample) pwe-args))
-      ;;else
+(defun init-para ()
+  "make left and right curves and stick them together (in a U/V shape) in a
+  single array for easier processing."
+  (let ((left  (make-curve 10000  left-exponent  left-width))
+        (right (make-curve 10000 right-exponent right-width)))
+    (setf para (make-array (1- (+ (second left) (second right)))))
+    (setf para-mid (second left))
+    ;copy (already) reversed left to left side of vector
+    (do ((i 0 (1+ i))) ((>= i (second left)))
+      (setf (aref para i) (caar left))
+      (setf (car left) (cdar left)))
+    ;(format t "parabola: ~a~%" para)
+    ;reverse right and copy to right side of vector
+    (do ((i (- (+ (second left) (second right)) 2) (1- i)))
+        ((< i (second left)))
+      (setf (aref para i) (caar right))
+      (setf (car right) (cdar right)))))
+
+(defun solve-para (x1 y1 x2 y2)
+  "return a function that takes x and returns the value of a paraboloid at x
+  where the paraboloid solves {<x1, y1>, <x2, y2>}"
+  (let ((y (- y2 y1))
+        (x (- x2 x1)))
+    ;;check for errors, early exit
+    (when (> (abs y) (aref para (1- (length para))))
+      (error "y is too big"))
+    (when (<= x 0)
+      (error "x is too small"))
+    (when (>= x (length para)) (return nil))
+    ;;ok, now real code
+    (let* ((left (< y 0))
+           ;;first get in the general area with integers
+           (res (binary-search-int y x left))
+           (i (if (or (= res 0) (= res (1- (length para))))
+                  res
+                  ;;then if we need to get closer to make up for poor precision
+                  (binary-search-float res y x left)))
+           (yOff (- y1 (interp i)))
+           (i (- i x1)))
+      (lambda (x)
+        ;(when (>= (+ x i) (length para))
+        ;  (break "detected array out of bounds"))
+        (+ (interp (+ x i)) yOff)))))
+
+(defun binary-search-int (y x left)
+  "do an integer binary search to find the best matching part of para for the
+  given vector (i.e. that would fit best between the two given points)."
+  (labels (
+    (bounds-check (start end)
+      (let ((ystart (- (aref para (+ start x)) (aref para start)))
+            (yend (- (aref para (+ end x)) (aref para end))))
+        (when (if left (> y yend) (< y ystart))
+          (error "internal math problem")))))
+
+    ;; the actual search
+    (let* ((start (if left 0 (1- (- para-mid x))))
+           (end (if left
+                    (min para-mid (1- (- (length para) x)))
+                    (1- (- (length para) x))))
+          )
+      (bounds-check start end)
+      ;;do a basic binary search
+      (do ((i (+ start 1) (+ start (/ (- end start) 2))))
+          ((or (= i start) (= i end))
+           i)
+        (let ((yi (- (aref para (+ i x)) (aref para i))))
+          (if (> yi y)
+              (setf end i)
+              (setf start i)))))))
+
+(defun binary-search-float (i y x left)
+  "do an increased-precision search that includes linear interpolation of para
+  to minimize the effect of precision errors on the final audio."
+  (let ((start (- i 1))
+        (end (+ i 1))
+        (dy 0)
+        (count 0))
+    (do ()
+        ((< (abs (- dy y)) .1)
+         i)
+      (incf count)
+      (when (> count 10000) (break "float loop"))
+      (setf i (+ start (/ (- end start) 2.0)))
+      (setf dy (- (interp (+ i x)) (interp i)))
+      (if (> dy y)
+          (setf end i)
+          (setf start i)))))
+
+(defun interp (i)
+  "linear interpolation of point i in para."
+  (let* ((low (truncate i))
+         (high (if (= i low) low (if (> i 0) (1+ low) (1- low))))
+         (fact (- high i)))
+    (+ (* fact (aref para low))
+       (* (- 1 fact) (aref para high)))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Sound buffer object
+;;
+;; The sound buffer takes a sound and a buffer size and returns any random
+;; sample, keeping everything needed in memory. _set-buffer-pos_ is used to
+;; tell it you're done with samples before that offset so it can discard the
+;; earlier samples.
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defun make-snd-buffer (sound buffer-size)
+  (list 0 ;position
+        sound
+        buffer-size
+        nil ;; list of buffer arrays
+        ))
+
+;(setf temp 3)
+
+(defun get-buffer-sample (buf samp-num)
+  (let ((pos (first buf))
+        (sound (second buf))
+        (size (third buf))
+        (bufs (fourth buf)))
+    (let ((buffer-num (truncate (/ (- samp-num pos) size))))
+      (while (>= buffer-num (length bufs))
+        (setf (nth 3 buf)
+              (nconc bufs (list (my-snd-fetch-array sound size))))
+              ;(if (>= temp 0) (progn
+              ;  (decf temp)
+              ;  (nconc bufs (list (let ((a (make-array size)))
+              ;                      (dotimes (i size)
+              ;                        (setf (aref a i) 0.0))
+              ;                      a))))
+              ;  bufs))
+        (setf bufs (fourth buf)))
+      (let* ((buf-vec (nth buffer-num bufs))
+             (idx (and buf-vec (rem (- samp-num pos) size)))
+             (sample (and buf-vec (< idx (length buf-vec))
+                          (aref buf-vec idx))))
+        (and sample (max sample -1000))))))
+
+(defun set-buffer-pos (buf pos)
+  "tell the buffer what position you're currently at, promising you won't need
+  any samples before pos, so that the buffer can discard earlier samples."
+  (let ((size (third buf)))
+    (while (< (+ (first buf) size) pos)
+      (setf (nth 3 buf) (rest (fourth buf))
+            (nth 0 buf) (+ (first buf) size)))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Compressor object
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; define class
+(setf compression-env (send class :new '(input-buf cur-para cur-para-end i)))
+
+;; constructor
+(send compression-env :answer :isnew '(snd)
+  '((progn
+     (setf input-buf (make-snd-buffer snd 1000)
+           ;; this is a function returning offsetted points of a paraboloid
+           cur-para nil
+           ;; the sample number where we need to get a new cur-para
+           cur-para-end 0
+           ;; the current sample number
+           i 0
+           first-samp t))
+     ;; set up some common data used in the cur-para function
+     (init-para)))
+
+;; obtain individual samples for the envelope
+(send compression-env :answer :next '() '(
+(labels ((samp (i) (get-buffer-sample input-buf i)))
+  ;; when we need to get a new cur-para
+  (when (or (null cur-para)
+            (and (= i cur-para-end) (samp (+ i 2))))
+    ;; this is the envelope fitting code. pretty, huh? I'd like to see *you*
+    ;; do better
+    (let ((iY (samp i))
+          ;; if this is the first time through the loop
+          (first (null cur-para))
+          ;; the point at the other end of the current paraboloid section
+          j jY)
+      (tagbody again
+        (setf j (1+ i)
+              jY (samp j))
+        (setf cur-para (solve-para i iY j jY)
+              cur-para-end j)
+        ;; j is almost certainly not right at this point, so keep looking
+        (loop
+          (incf j)
+          (when (null (samp j)) (progn
+            (when (null cur-para)
+              (setf cur-para (solve-para i iY j jY)))
+            (return)))
+          (setf jY (samp j))
+          (let (iY-changed
+                (parY -1))
+            ;; comments? you need comments?
+            (when (and first
+                       (> (/ (/ (- jY iY) right-width) (- j i)) .01))
+              (progn
+                (setf iY-changed t)
+                (setf iY (- jY (* .01 (* right-width (- j i)))))))
+            (when cur-para
+              (setf parY (funcall cur-para j)))
+            (when (>= parY 0)
+              (return))
+            (when (or (< parY jY) iY-changed (null cur-para)) (progn
+              (setf cur-para (solve-para i iY j jY))
+              (setf cur-para-end j)))))
+        (when first (progn
+          (setf first nil)
+          ;;iY now has the value it needs, but the paraboloid
+          ;;could overlap some peaks, so we need to recalculate those now
+          (go again))))))
+  (when (= 0 (rem i 1000)) (set-buffer-pos input-buf i))
+  (let* ((v (funcall cur-para i))
+         ;;s-min seems to behave strangely, so we do the floor/noisegate thing
+         ;;here instead
+         (res (if (> v floor)
+                  v
+                  (+ (* (- v floor) -1 noise-factor)
+                     floor))))
+    ;;put out an extra sample at the beginning.
+    ;;otherwise it doesn't line up for some weird reason. who knows?
+    (if first-samp
+      (progn (setf first-samp nil) 
+        res)
       (progn
-	;;this is the starting scale
-	(push (adjust-samp
-	       (- (car right-top)
-		  (* left-falloff (cadr right-top))))
-	      pwe-args)
-	(push 0.0 pwe-args))))
-  (mult s (pwe-list pwe-args)))
+        (incf i)
+        ;;put an extra sample at the end, too.
+        ;;otherwise the volume drops off at the very end
+        ;;because nyquist adds an implicit last sample with value 0
+        (if (and (null (samp i)) (null (samp (1- i))))
+          ;(progn (close debug) nil)
+          nil
+          res)))))))
+
+(defun get-compression-env (snd)
+  (let ((sound (if (arrayp snd) (aref snd 1) snd)))
+    (snd-fromobject (snd-t0 sound) (snd-srate sound)
+                    (send compression-env :new snd))))
+
+(defun get-my-sound (sound)
+  "take care of averaging and multichannel bookkeeping"
+  (let ((sound (if (= use-percep 1) (get-percep-adjusted-sound sound) sound))
+        (avg-fun (lambda (snd) (snd-avg snd (* 2 *window-size*) *window-size* op-peak))))
+    (if (arrayp sound)
+        (let ((avg-channels (make-array (length sound))))
+          (dotimes (i (length sound))
+            (setf (aref avg-channels i)
+                  (funcall avg-fun (aref sound i))))
+          avg-channels)
+        (funcall avg-fun sound))))
+
+(defun do-compression ()
+  (let* ((ret (get-my-sound s))
+         (srate (my-snd-srate ret)))
+    (setf right-width (* right-width-s srate))
+    (setf  left-width (*  left-width-s srate))
+
+    ;;get-compression-env applies linear-to-db(max(abs(s))) to its input
+    (setf ret (get-compression-env ret))
+    (setf ret (mult compress-ratio ret))
+    (setf ret (db-to-linear ret))
+    (setf ret (recip ret))
+    (setf ret (mult scale-max ret))
+    ;(snd-length ret 10000000000)
+    (mult s ret)
+    ))
+
+(defun prin (&rest args)
+  ;(dolist (x args)
+  ;  (princ x debug))
+  ;(terpri debug)
+  )
+
+;(setf debug (open "C:\\debug.txt" :direction :output))
+(do-compression)

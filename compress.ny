@@ -8,20 +8,20 @@
 ;version 1
 ;type process
 ;categories "http://lv2plug.in/ns/lv2core#CompressorPlugin"
-;name "Compress &dynamics..."
+;name "Compress &dynamics (advanced)..."
 ;action "Compressing..."
 ;info "Does dynamic (volume) compression with lookahead.\n'Compression level' is how much compression to apply. Raise when soft parts\n  are too soft, and lower to keep some dynamic range. You can soften the\n  soft parts instead of increasing them with values < 0, and invert\n  loudness with values > 1 (lower max amp when you do).\n'Hardness' is how agressively to compress. Raise when parts are still\n  hard to hear (even with a high compress ratio). Lower when the result\n  sounds distorted.\nRaise 'floor' to make quiet parts stay quiet.\nRaise 'noise gate falloff' to make quiet parts (beneath 'floor') disappear.\nLower 'renormalize' if you experience clipping.\nEnable 'Compress bright sounds' to adjust for the perceived loudness of\n  bright (brassy) sounds."
 ;control compress-ratio "Compression level" real "" .5 -.5 1.25
 
 ;; TO ENABLE ADVANCED SETTINGS: delete one semicolon from the beginning of the next two lines, then add one to following four.
 
-;;control left-width-s "Release speed" real "~ms" 510 1 5000
-;;control right-width-s "Attack speed" real "~ms" 340 1 5000
+;control left-width-s "Release speed" real "~ms" 510 1 5000
+;control right-width-s "Attack speed" real "~ms" 340 1 5000
 
-;control hardness "Compression hardness" real "" .611 .1 1
-(setf hardness (* (- 1.2 hardness) 1.7))
-(setf left-width-s (* (expt hardness 2.5) 510))
-(setf right-width-s (* (expt hardness 2.5) 340))
+;;control hardness "Compression hardness" real "" .611 .1 1
+;(setf hardness (* (- 1.2 hardness) 1.7))
+;(setf left-width-s (* (expt hardness 2.5) 510))
+;(setf right-width-s (* (expt hardness 2.5) 340))
 
 ;control floor "Floor" real "dB" -32 -96 0
 ;control noise-factor "Noise gate falloff" real "factor" 0 -2 10
@@ -29,11 +29,11 @@
 
 ;; TO ENABLE ADVANCED SETTINGS: delete one semicolon from the beginning of the next two lines, then add one to following two.
 
-;;control left-exponent "Release exponent" real "" 2 1 6
-;;control right-exponent "Attack exponent" real "" 4 1 6
+;control left-exponent "Release exponent" real "" 2 1 6
+;control right-exponent "Attack exponent" real "" 4 1 6
 
-(setf left-exponent 2)
-(setf right-exponent 4)
+;(setf left-exponent 2)
+;(setf right-exponent 4)
 
 
 ;control use-percep-high "Compress bright sounds" int "yes/no" 1 0 1
